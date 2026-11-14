@@ -40,6 +40,7 @@ using irutils::addModeToString;
 using irutils::addTempToString;
 using irutils::checkInvertedBytePairs;
 using irutils::invertBytePairs;
+using irutils::addModelToString;
 
 #if SEND_TOSHIBA_AC
 /// Send a Toshiba A/C message.
@@ -104,8 +105,9 @@ void IRToshibaAC::send(const uint16_t repeat) {
 uint16_t IRToshibaAC::getInternalStateLength(const uint8_t state[],
                                              const uint16_t size) {
   if (size < kToshibaAcLengthByte) return 0;
-  return std::min((uint16_t)(state[kToshibaAcLengthByte] + kToshibaAcMinLength),
-                  kToshibaACStateLengthLong);
+  // Fix: Extract the last 4 bits instead
+  return std::min(static_cast<uint16_t>((state[kToshibaAcLengthByte] & 0xF)
+    + kToshibaAcMinLength), kToshibaACStateLengthLong);
 }
 
 /// Get the length of the current internal state per the protocol structure.
@@ -216,9 +218,7 @@ void IRToshibaAC::setTemp(const uint8_t degrees) {
 
 /// Get the current temperature setting.
 /// @return The current setting for temp. in degrees celsius.
-uint8_t IRToshibaAC::getTemp(void) const {
-  return _.Temp + kToshibaAcMinTemp;
-}
+uint8_t IRToshibaAC::getTemp(void) const { return _.Temp + kToshibaAcMinTemp; }
 
 /// Set the speed of the fan.
 /// @param[in] speed The desired setting (0 is Auto, 1-5 is the speed, 5 is Max)
@@ -339,6 +339,19 @@ void IRToshibaAC::setEcono(const bool on) {
   }
 }
 
+/// Get the filter (Pure/Ion Filter) setting of the A/C.
+/// @return true, if the current setting is on. Otherwise, false.
+bool IRToshibaAC::getFilter(void) const {
+  return (getStateLength() >= kToshibaACStateLength) ? _.Filter : false;
+}
+
+/// Set the filter (Pure/Ion Filter) setting of the A/C.
+/// @param[in] on true, the setting is on. false, the setting is off.
+void IRToshibaAC::setFilter(const bool on) {
+  _.Filter = on;
+  if (on) setStateLength(std::min(kToshibaACStateLength, getStateLength()));
+}
+
 /// Convert a stdAc::opmode_t enum into its native mode.
 /// @param[in] mode The enum to be converted.
 /// @return The native equivalent of the enum.
@@ -398,7 +411,7 @@ stdAc::fanspeed_t IRToshibaAC::toCommonFanSpeed(const uint8_t spd) {
 /// Convert the current internal state into its stdAc::state_t equivalent.
 /// @return The stdAc equivalent of the native settings.
 stdAc::state_t IRToshibaAC::toCommon(const stdAc::state_t *prev) const {
-  stdAc::state_t result;
+  stdAc::state_t result{};
   // Start with the previous state if given it.
   if (prev != NULL) {
     result = *prev;
@@ -421,6 +434,7 @@ stdAc::state_t IRToshibaAC::toCommon(const stdAc::state_t *prev) const {
     result.fanspeed = toCommonFanSpeed(getFan());
     result.turbo = getTurbo();
     result.econo = getEcono();
+    result.filter = getFilter();
   }
   switch (getSwing()) {
     case kToshibaAcSwingOn:
@@ -436,7 +450,6 @@ stdAc::state_t IRToshibaAC::toCommon(const stdAc::state_t *prev) const {
   }
   // Not supported.
   result.light = false;
-  result.filter = false;
   result.swingh = stdAc::swingh_t::kOff;
   result.quiet = false;
   result.clean = false;
@@ -450,8 +463,9 @@ stdAc::state_t IRToshibaAC::toCommon(const stdAc::state_t *prev) const {
 /// @return A human readable string.
 String IRToshibaAC::toString(void) const {
   String result = "";
-  result.reserve(80);
-  result += addTempToString(getTemp(), true, false);
+  result.reserve(95);
+  result += addModelToString(decode_type_t::TOSHIBA_AC, getModel(), false);
+  result += addTempToString(getTemp(), true);
   switch (getStateLength()) {
     case kToshibaACStateLengthShort:
       result += addIntToString(getSwing(true), kSwingVStr);
@@ -477,8 +491,33 @@ String IRToshibaAC::toString(void) const {
                                kToshibaAcFanMed);
       result += addBoolToString(getTurbo(), kTurboStr);
       result += addBoolToString(getEcono(), kEconoStr);
+      result += addBoolToString(getFilter(), kFilterStr);
   }
   return result;
+}
+
+/// Get the model information currently known.
+/// @return The known model number.
+toshiba_ac_remote_model_t IRToshibaAC::getModel(void) const {
+  switch (_.Model) {
+    case kToshibaAcRemoteB:
+      return toshiba_ac_remote_model_t::kToshibaGenericRemote_B;
+    default:
+      return toshiba_ac_remote_model_t::kToshibaGenericRemote_A;
+  }
+}
+
+/// Set the current model for the remote.
+/// @param[in] model The model number.
+void IRToshibaAC::setModel(const toshiba_ac_remote_model_t model) {
+  switch (model) {
+    case toshiba_ac_remote_model_t::kToshibaGenericRemote_B:
+      _.Model = kToshibaAcRemoteB;
+      break;
+    default:
+      _.Model = kToshibaAcRemoteA;
+      break;
+  }
 }
 
 #if DECODE_TOSHIBA_AC

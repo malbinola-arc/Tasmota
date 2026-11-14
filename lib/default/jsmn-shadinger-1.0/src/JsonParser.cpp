@@ -305,7 +305,7 @@ JsonParser::~JsonParser() {
 }
 
 const JsonParserObject JsonParser::getRootObject(void) const {
-  return JsonParserObject(&_tokens[0]);
+  return (_tokens != nullptr) ? JsonParserObject(&_tokens[0]) : JsonParserObject(&token_bad);
 }
 
 const JsonParserToken JsonParser::operator[](int32_t i) const {
@@ -370,6 +370,9 @@ uint64_t JsonParserToken::getULong(void) const { return getULong(0); }
 float JsonParserToken::getFloat(void) const { return getFloat(0); }
 const char * JsonParserToken::getStr(void) const { return getStr(""); }
 
+bool JsonParserObject::getBool(const char * needle, bool val) const {
+  return (*this)[needle].getBool(val);
+}
 int32_t JsonParserObject::getInt(const char * needle, int32_t val) const {
   return (*this)[needle].getInt(val);
 }
@@ -405,9 +408,11 @@ void JsonParser::parse(char * json_in) {
   allocate();
   jsmn_init(&this->_parser);
   _token_len = jsmn_parse(&this->_parser, json_in, json_len, _tokens, _size);
-  // TODO error checking
-  if (_token_len >= 0) {
+  if ((_tokens != nullptr) && (_token_len >= 0)) {
     postProcess(json_len);
+  } else {
+    this->free();
+    _token_len = 0;
   }
 }
 
@@ -548,5 +553,6 @@ void JsonParser::allocate(void) {
   this->free();
   if (_size != 0) {
     _tokens = new jsmntok_t[_size];
+    if (!_tokens) { _size = 0; }
   }
 }

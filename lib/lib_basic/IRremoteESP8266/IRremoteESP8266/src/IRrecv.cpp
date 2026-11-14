@@ -13,7 +13,7 @@ extern "C" {
 }
 #endif  // ESP8266
 #include <Arduino.h>
-#endif
+#endif  // UNIT_TEST
 #include <algorithm>
 #ifdef UNIT_TEST
 #include <cassert>
@@ -56,6 +56,24 @@ static ETSTimer timer;
 }  // namespace _IRrecv
 #endif  // ESP8266
 #if defined(ESP32)
+#if ( defined(ESP_ARDUINO_VERSION) && \
+    (ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)) )
+#define _ESP32_ARDUINO_CORE_V3PLUS
+#endif  // ESP_ARDUINO_VERSION >= 3
+// We need a horrible timer hack for ESP32 Arduino framework < v2.0.0
+#if !defined(_ESP32_ARDUINO_CORE_V2PLUS)
+// Version check
+#if ( defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 2) )
+// No need for the hack if we are running version >= 2.0.0
+#define _ESP32_ARDUINO_CORE_V2PLUS false
+#else  // Version check
+// If no ESP_ARDUINO_VERSION_MAJOR is defined, or less than 2, then we are
+// using an old ESP32 core, so we need the hack.
+#define _ESP32_ARDUINO_CORE_V2PLUS true
+#endif  // Version check
+#endif  // !defined(_ESP32_ARDUINO_CORE_V2PLUS)
+
+#if _ESP32_ARDUINO_CORE_V2PLUS
 // Required structs/types from:
 // https://github.com/espressif/arduino-esp32/blob/6b0114366baf986c155e8173ab7c22bc0c5fcedc/cores/esp32/esp32-hal-timer.c#L28-L58
 // These are needed to be able to directly manipulate the timer registers from
@@ -117,10 +135,10 @@ typedef struct hw_timer_s {
         uint8_t timer;
         portMUX_TYPE lock;
 } hw_timer_t;
-// End of Horrible Hack.
+#endif  // _ESP32_ARDUINO_CORE_V2PLUS / End of Horrible Hack.
 
 namespace _IRrecv {
-static hw_timer_t * timer = NULL;
+static hw_timer_t *timer = NULL;
 }  // namespace _IRrecv
 #endif  // ESP32
 using _IRrecv::timer;
@@ -211,21 +229,31 @@ static void USE_IRAM_ATTR gpio_intr() {
 #if defined(ESP32)
   // Reset the timeout.
   //
-  // The following three lines of code are the equiv of:
+#if _ESP32_ARDUINO_CORE_V2PLUS
+  // The following three lines of code are the equivalent of:
   //   `timerWrite(timer, 0);`
   // We can't call that routine safely from inside an ISR as that procedure
   // is not stored in IRAM. Hence, we do it manually so that it's covered by
   // USE_IRAM_ATTR in this ISR.
   // @see https://github.com/crankyoldgit/IRremoteESP8266/issues/1350
   // @see https://github.com/espressif/arduino-esp32/blob/6b0114366baf986c155e8173ab7c22bc0c5fcedc/cores/esp32/esp32-hal-timer.c#L106-L110
-  timer->dev->load_high = (uint32_t) 0;
-  timer->dev->load_low = (uint32_t) 0;
+  timer->dev->load_high = static_cast<uint32_t>(0);
+  timer->dev->load_low = static_cast<uint32_t>(0);
   timer->dev->reload = 1;
   // The next line is the same, but instead replaces:
   //   `timerAlarmEnable(timer);`
   // @see https://github.com/crankyoldgit/IRremoteESP8266/issues/1350
   // @see https://github.com/espressif/arduino-esp32/blob/6b0114366baf986c155e8173ab7c22bc0c5fcedc/cores/esp32/esp32-hal-timer.c#L176-L178
   timer->dev->config.alarm_en = 1;
+#elif defined(_ESP32_ARDUINO_CORE_V3PLUS)
+  // For ESP32 core version 3.x, replace `timerAlarmEnable`
+  timerWrite(timer, 0);
+  uint64_t alarm_value = 50000;  // Example value (50ms)
+  timerAlarm(timer, alarm_value, false, 0);
+#else  // !_ESP32_ARDUINO_CORE_V3PLUS
+  timerWrite(timer, 0);
+  timerAlarmEnable(timer);
+#endif  // _ESP32_ARDUINO_CORE_V2PLUS
 #endif  // ESP32
 }
 #endif  // UNIT_TEST
@@ -242,13 +270,20 @@ static void USE_IRAM_ATTR gpio_intr() {
 ///   capturing data. (Default: kTimeoutMs)
 /// @param[in] save_buffer Use a second (save) buffer to decode from.
 ///   (Default: false)
-/// @param[in] timer_num Nr. of the ESP32 timer to use (0 to 3) (ESP32 Only)
+/// @param[in] timer_num Nr. of the ESP32 timer to use. (0 to 3) (ESP32 Only)
+///   or (0 to 1) (ESP32-C3)
 #if defined(ESP32)
 IRrecv::IRrecv(const uint16_t recvpin, const uint16_t bufsize,
                const uint8_t timeout, const bool save_buffer,
                const uint8_t timer_num) {
-  // There are only 4 timers. 0 to 3.
-  _timer_num = std::min(timer_num, (uint8_t)3);
+  // Ensure we use a valid timer number.
+  _timer_num = std::min(timer_num,
+                        (uint8_t)(
+#ifdef SOC_TIMER_GROUP_TOTAL_TIMERS
+                                  SOC_TIMER_GROUP_TOTAL_TIMERS - 1));
+#else  // SOC_TIMER_GROUP_TOTAL_TIMERS
+                                  3));
+#endif  // SOC_TIMER_GROUP_TOTAL_TIMERS
 #else  // ESP32
 /// @cond IGNORE
 /// Class constructor
@@ -332,12 +367,33 @@ void IRrecv::enableIRIn(const bool pullup) {
   }
 #if defined(ESP32)
   // Initialise the ESP32 timer.
+#if defined(_ESP32_ARDUINO_CORE_V3PLUS)
+  // Use newer timerBegin signature for ESP32 core version 3.x
+  timer = timerBegin(1000000);  // Initialize with 1MHz (1us per tick)
+#else  // _ESP32_ARDUINO_CORE_V3PLUS
   // 80MHz / 80 = 1 uSec granularity.
   timer = timerBegin(_timer_num, 80, true);
-  // Set the timer so it only fires once, and set it's trigger in uSeconds.
+#endif  // _ESP32_ARDUINO_CORE_V3PLUS
+
+  // Ensure the timer is successfully initialized
+#ifdef DEBUG
+  if (timer == NULL) {
+    DPRINT("FATAL: Unable enable system timer: ");
+    DPRINTLN((uint16_t)_timer_num);
+  }
+#endif  // DEBUG
+  assert(timer != NULL);  // Check we actually got the timer.
+  // Set the timer so it only fires once, and set its trigger in microseconds.
+#if defined(_ESP32_ARDUINO_CORE_V3PLUS)
+  timerWrite(timer, 0);  // Reset the timer for ESP32 core version 3.x
+  timerAttachInterrupt(timer, &read_timeout);
+#else  // _ESP32_ARDUINO_CORE_V3PLUS
   timerAlarmWrite(timer, MS_TO_USEC(params.timeout), ONCE);
   // Note: Interrupt needs to be attached before it can be enabled or disabled.
-  timerAttachInterrupt(timer, &read_timeout, true);
+  // Note: EDGE (true) is not supported, use LEVEL (false). Ref: #1713
+  // See: https://github.com/espressif/arduino-esp32/blob/caef4006af491130136b219c1205bdcf8f08bf2b/cores/esp32/esp32-hal-timer.c#L224-L227
+  timerAttachInterrupt(timer, &read_timeout, false);
+#endif  // _ESP32_ARDUINO_CORE_V3PLUS
 #endif  // ESP32
 
   // Initialise state machine variables
@@ -361,13 +417,28 @@ void IRrecv::disableIRIn(void) {
 #ifndef UNIT_TEST
 #if defined(ESP8266)
   os_timer_disarm(&timer);
-#endif  // ESP8266
-#if defined(ESP32)
+#elif defined(_ESP32_ARDUINO_CORE_V3PLUS)
+  timerWrite(timer, 0);  // Reset the timer
+  timerDetachInterrupt(timer);
+  timerEnd(timer);
+#elif defined(ESP32)
   timerAlarmDisable(timer);
+  timerDetachInterrupt(timer);
   timerEnd(timer);
 #endif  // ESP32
   detachInterrupt(params.recvpin);
 #endif  // UNIT_TEST
+}
+
+/// Pause collection of received IR data.
+/// @see IRrecv class constructor
+void IRrecv::pause(void) {
+  params.rcvstate = kStopState;
+  params.rawlen = 0;
+  params.overflow = false;
+#if defined(ESP32)
+  gpio_intr_disable((gpio_num_t)params.recvpin);
+#endif  // ESP32
 }
 
 /// Resume collection of received IR data.
@@ -379,7 +450,14 @@ void IRrecv::resume(void) {
   params.rawlen = 0;
   params.overflow = false;
 #if defined(ESP32)
+  // Check for ESP32 core version and handle timer functions differently
+#if defined(_ESP32_ARDUINO_CORE_V3PLUS)
+  timerWrite(timer, 0);  // Reset the timer (no need for timerAlarmDisable)
+#else  // _ESP32_ARDUINO_CORE_V3PLUS
   timerAlarmDisable(timer);
+#endif  // _ESP32_ARDUINO_CORE_V3PLUS
+  // Re-enable GPIO interrupt in both versions
+  gpio_intr_enable((gpio_num_t)params.recvpin);
 #endif  // ESP32
 }
 
@@ -654,9 +732,12 @@ bool IRrecv::decode(decode_results *results, irparams_t *save,
       return true;
 #endif
 #if DECODE_PANASONIC
-    DPRINTLN("Attempting Panasonic decode");
+    DPRINTLN("Attempting Panasonic (48-bit) decode");
     if (decodePanasonic(results, offset)) return true;
-#endif
+    DPRINTLN("Attempting Panasonic (40-bit) decode");
+    if (decodePanasonic(results, offset, kPanasonic40Bits, true,
+                        kPanasonic40Manufacturer)) return true;
+#endif  // DECODE_PANASONIC
 #if DECODE_LG
     DPRINTLN("Attempting LG (28-bit) decode");
     if (decodeLG(results, offset, kLgBits, true)) return true;
@@ -694,10 +775,15 @@ bool IRrecv::decode(decode_results *results, irparams_t *save,
     DPRINTLN("Attempting Sharp decode");
     if (decodeSharp(results, offset)) return true;
 #endif
+#if DECODE_BOSCH144
+    DPRINTLN("Attempting Bosch 144-bit decode");
+    // Bosch is similar to Coolix, so it must be attempted before decodeCOOLIX.
+    if (decodeBosch144(results, offset)) return true;
+#endif  // DECODE_BOSCH144
 #if DECODE_COOLIX
-    DPRINTLN("Attempting Coolix decode");
+    DPRINTLN("Attempting Coolix 24-bit decode");
     if (decodeCOOLIX(results, offset)) return true;
-#endif
+#endif  // DECODE_COOLIX
 #if DECODE_NIKAI
     DPRINTLN("Attempting Nikai decode");
     if (decodeNikai(results, offset)) return true;
@@ -809,6 +895,18 @@ bool IRrecv::decode(decode_results *results, irparams_t *save,
     if (decodeHitachiAC(results, offset, kHitachiAc344Bits, true, false))
       return true;
 #endif  // DECODE_HITACHI_AC344
+#if DECODE_HITACHI_AC264
+    // HitachiAC264 should be checked before HitachiAC
+    DPRINTLN("Attempting Hitachi AC264 decode");
+    if (decodeHitachiAC(results, offset, kHitachiAc264Bits, true, false))
+      return true;
+#endif  // DECODE_HITACHI_AC264
+#if DECODE_HITACHI_AC296
+    // HitachiAC296 should be checked before HitachiAC
+    DPRINTLN("Attempting Hitachi AC296 decode");
+    if (decodeHitachiAc296(results, offset, kHitachiAc296Bits, true))
+      return true;
+#endif  // DECODE_HITACHI_AC296
 #if DECODE_HITACHI_AC2
     // HitachiAC2 should be checked before HitachiAC
     DPRINTLN("Attempting Hitachi AC2 decode");
@@ -830,8 +928,7 @@ bool IRrecv::decode(decode_results *results, irparams_t *save,
     DPRINTLN("Attempting Samsung AC (extended) decode");
     // Check the extended size first, as it should fail fast due to longer
     // length.
-    if (decodeSamsungAC(results, offset, kSamsungAcExtendedBits, false))
-      return true;
+    if (decodeSamsungAC(results, offset, kSamsungAcExtendedBits)) return true;
     // Now check for the more common length.
     DPRINTLN("Attempting Samsung AC decode");
     if (decodeSamsungAC(results, offset, kSamsungAcBits)) return true;
@@ -880,8 +977,21 @@ bool IRrecv::decode(decode_results *results, irparams_t *save,
       return true;
 #endif
 #if DECODE_ARGO
-    DPRINTLN("Attempting Argo decode");
-    if (decodeArgo(results, offset)) return true;
+  DPRINTLN("Attempting Argo WREM3 decode (AC Control)");
+  if (decodeArgoWREM3(results, offset, kArgo3AcControlStateLength * 8, true))
+    return true;
+  DPRINTLN("Attempting Argo WREM3 decode (iFeel report)");
+  if (decodeArgoWREM3(results, offset, kArgo3iFeelReportStateLength * 8, true))
+    return true;
+  DPRINTLN("Attempting Argo WREM3 decode (Config)");
+  if (decodeArgoWREM3(results, offset, kArgo3ConfigStateLength * 8, true))
+    return true;
+  DPRINTLN("Attempting Argo WREM3 decode (Timer)");
+  if (decodeArgoWREM3(results, offset, kArgo3TimerStateLength * 8, true))
+    return true;
+  DPRINTLN("Attempting Argo WREM2 decode");
+    if (decodeArgo(results, offset, kArgoBits) ||
+        decodeArgo(results, offset, kArgoShortBits, false)) return true;
 #endif  // DECODE_ARGO
 #if DECODE_SHARP_AC
     DPRINTLN("Attempting SHARP_AC decode");
@@ -1024,8 +1134,12 @@ bool IRrecv::decode(decode_results *results, irparams_t *save,
     DPRINTLN("Attempting Teknopoint decode");
     if (decodeTeknopoint(results, offset)) return true;
 #endif  // DECODE_TEKNOPOINT
+#if DECODE_KELON168
+    DPRINTLN("Attempting Kelon 168-bit decode");
+    if (decodeKelon168(results, offset)) return true;
+#endif  // DECODE_KELON168
 #if DECODE_KELON
-    DPRINTLN("Attempting Kelon decode");
+    DPRINTLN("Attempting Kelon 48-bit decode");
     if (decodeKelon(results, offset)) return true;
 #endif  // DECODE_KELON
 #if DECODE_SANYO_AC88
@@ -1036,6 +1150,79 @@ bool IRrecv::decode(decode_results *results, irparams_t *save,
     DPRINTLN("Attempting Bose decode");
     if (decodeBose(results, offset)) return true;
 #endif  // DECODE_BOSE
+#if DECODE_ARRIS
+    DPRINTLN("Attempting Arris decode");
+    if (decodeArris(results, offset)) return true;
+#endif  // DECODE_ARRIS
+#if DECODE_RHOSS
+    DPRINTLN("Attempting Rhoss decode");
+    if (decodeRhoss(results, offset)) return true;
+#endif  // DECODE_RHOSS
+#if DECODE_AIRTON
+    DPRINTLN("Attempting Airton decode");
+    if (decodeAirton(results, offset)) return true;
+#endif  // DECODE_AIRTON
+#if DECODE_COOLIX48
+    DPRINTLN("Attempting Coolix 48-bit decode");
+    if (decodeCoolix48(results, offset)) return true;
+#endif  // DECODE_COOLIX48
+#if DECODE_DAIKIN200
+    DPRINTLN("Attempting Daikin 200-bit decode");
+    if (decodeDaikin200(results, offset)) return true;
+#endif  // DECODE_DAIKIN200
+#if DECODE_HAIER_AC160
+    DPRINTLN("Attempting Haier AC 160 bit decode");
+    if (decodeHaierAC160(results, offset)) return true;
+#endif  // DECODE_HAIER_AC160
+#if DECODE_CARRIER_AC128
+    DPRINTLN("Attempting Carrier AC 128-bit decode");
+    if (decodeCarrierAC128(results, offset)) return true;
+#endif  // DECODE_CARRIER_AC128
+#if DECODE_TOTO
+    DPRINTLN("Attempting Toto 48/24-bit decode");
+    if (decodeToto(results, offset, kTotoLongBits) ||  // Long needs to be first
+        decodeToto(results, offset, kTotoShortBits)) return true;
+#endif  // DECODE_TOTO
+#if DECODE_CLIMABUTLER
+    DPRINTLN("Attempting ClimaButler decode");
+    if (decodeClimaButler(results)) return true;
+#endif  // DECODE_CLIMABUTLER
+#if DECODE_TCL96AC
+    DPRINTLN("Attempting TCL AC 96-bit decode");
+    if (decodeTcl96Ac(results, offset)) return true;
+#endif  // DECODE_TCL96AC
+#if DECODE_SANYO_AC152
+    DPRINTLN("Attempting Sanyo AC 152-bit decode");
+    if (decodeSanyoAc152(results, offset)) return true;
+#endif  // DECODE_SANYO_AC152
+#if DECODE_DAIKIN312
+    DPRINTLN("Attempting Daikin 312-bit decode");
+    if (decodeDaikin312(results, offset)) return true;
+#endif  // DECODE_DAIKIN312
+#if DECODE_GORENJE
+    DPRINTLN("Attempting GORENJE decode");
+    if (decodeGorenje(results, offset)) return true;
+#endif  // DECODE_GORENJE
+#if DECODE_WOWWEE
+    DPRINTLN("Attempting WOWWEE decode");
+    if (decodeWowwee(results, offset)) return true;
+#endif  // DECODE_WOWWEE
+#if DECODE_CARRIER_AC84
+    DPRINTLN("Attempting Carrier A/C 84-bit decode");
+    if (decodeCarrierAC84(results, offset)) return true;
+#endif  // DECODE_CARRIER_AC84
+#if DECODE_YORK
+    DPRINTLN("Attempting York decode");
+    if (decodeYork(results, offset, kYorkBits)) return true;
+#endif  // DECODE_YORK
+#if DECODE_BLUESTARHEAVY
+    DPRINTLN("Attempting BluestarHeavy decode");
+    if (decodeBluestarHeavy(results, offset, kBluestarHeavyBits)) return true;
+#endif  // DECODE_BLUESTARHEAVY
+#if DECODE_EUROM
+    DPRINTLN("Attempting Eurom decode");
+    if (decodeEurom(results, offset, kEuromBits)) return true;
+#endif  // DECODE_EUROM
   // Typically new protocols are added above this line.
   }
 #if DECODE_HASH
@@ -1050,7 +1237,7 @@ bool IRrecv::decode(decode_results *results, irparams_t *save,
   if (!resumed)  // Check if we have already resumed.
     resume();
   return false;
-}
+}  // NOLINT(readability/fn_size)
 
 /// Convert the tolerance percentage into something valid.
 /// @param[in] percentage An integer percentage.
@@ -1066,9 +1253,10 @@ uint8_t IRrecv::_validTolerance(const uint8_t percentage) {
 uint32_t IRrecv::ticksLow(const uint32_t usecs, const uint8_t tolerance,
                           const uint16_t delta) {
   // max() used to ensure the result can't drop below 0 before the cast.
-  return ((uint32_t)std::max(
-      (int32_t)(usecs * (1.0 - _validTolerance(tolerance) / 100.0) - delta),
-      0));
+  return (static_cast<uint32_t>(std::max(
+      static_cast<int32_t>(usecs * (1.0 - _validTolerance(tolerance) / 100.0) -
+          delta),
+      static_cast<int32_t>(0))));
 }
 
 /// Calculate the upper bound of the nr. of ticks.
@@ -1078,8 +1266,8 @@ uint32_t IRrecv::ticksLow(const uint32_t usecs, const uint8_t tolerance,
 /// @return Nr. of ticks.
 uint32_t IRrecv::ticksHigh(const uint32_t usecs, const uint8_t tolerance,
                            const uint16_t delta) {
-  return ((uint32_t)(usecs * (1.0 + _validTolerance(tolerance) / 100.0)) + 1 +
-          delta);
+  return (static_cast<uint32_t>(usecs * (1.0 + _validTolerance(tolerance) /
+                                100.0)) + 1 + delta);
 }
 
 /// Check if we match a pulse(measured) with the desired within
@@ -1130,8 +1318,9 @@ bool IRrecv::matchAtLeast(uint32_t measured, uint32_t desired,
   DPRINT(". Matching: ");
   DPRINT(measured);
   DPRINT(" >= ");
-  DPRINT(ticksLow(std::min(desired, MS_TO_USEC(params.timeout)), tolerance,
-                  delta));
+  DPRINT(ticksLow(std::min(desired,
+                           static_cast<uint32_t>(MS_TO_USEC(params.timeout))),
+                  tolerance, delta));
   DPRINT(" [min(");
   DPRINT(ticksLow(desired, tolerance, delta));
   DPRINT(", ");
@@ -1151,8 +1340,9 @@ bool IRrecv::matchAtLeast(uint32_t measured, uint32_t desired,
   // We really should never get a value of 0, except as the last value
   // in the buffer. If that is the case, then assume infinity and return true.
   if (measured == 0) return true;
-  return measured >= ticksLow(std::min(desired, MS_TO_USEC(params.timeout)),
-                              tolerance, delta);
+  return measured >= ticksLow(std::min(
+      desired, static_cast<uint32_t>(MS_TO_USEC(params.timeout))), tolerance,
+      delta);
 }
 
 /// Check if we match a mark signal(measured) with the desired within
@@ -1811,6 +2001,7 @@ uint16_t IRrecv::matchManchesterData(volatile const uint16_t *data_ptr,
                                      const int16_t excess,
                                      const bool MSBfirst,
                                      const bool GEThomas) {
+  DPRINTLN("DEBUG: Entered matchManchesterData");
   uint16_t offset = 0;
   uint64_t data = 0;
   uint16_t nr_half_periods = 0;
@@ -1824,7 +2015,10 @@ uint16_t IRrecv::matchManchesterData(volatile const uint16_t *data_ptr,
   uint16_t min_remaining = nbits;
 
   // Check if there is enough capture buffer to possibly have the message.
-  if (remaining < min_remaining) return 0;  // Nope, so abort.
+  if (remaining < min_remaining) {
+    DPRINTLN("DEBUG: Ran out of capture buffer!");
+    return 0;  // Nope, so abort.
+  }
 
   // Convert to ticks. Optimisation: Saves on math/extra instructions later.
   uint16_t bank = starting_balance / kRawTick;
@@ -1847,22 +2041,39 @@ uint16_t IRrecv::matchManchesterData(volatile const uint16_t *data_ptr,
   while ((offset < remaining || bank) &&
          nr_half_periods < expected_half_periods) {
     // Get the next entry if we haven't anything existing to process.
+    DPRINT("DEBUG: Offset = ");
+    DPRINTLN(offset);
     if (!bank) bank = *(data_ptr + offset++);
+    DPRINT("DEBUG: Bank = ");
+    DPRINTLN(bank * kRawTick);
     // Check if we don't have a short interval.
-    if (!match(bank, half_period, tolerance, excess))  return 0;  // Not valid.
+    DPRINTLN("DEBUG: Checking for short interval");
+    if (!match(bank, half_period, tolerance, excess)) {
+      DPRINTLN("DEBUG: It is. Exiting");
+      return 0;  // Not valid.
+    }
     // We've succeeded in matching half a period, so count it.
     nr_half_periods++;
+    DPRINT("DEBUG: Half Periods = ");
+    DPRINTLN(nr_half_periods);
     // We've now used up our bank, so refill it with the next item, unless we
     // are at the end of the capture buffer.
     // If we are assume a single half period of "space".
-    if (offset < remaining)
+    if (offset < remaining) {
+      DPRINT("DEBUG: Offset = ");
+      DPRINTLN(offset);
       bank = *(data_ptr + offset++);
-    else if (offset == remaining)
+    } else if (offset == remaining) {
       bank = raw_half_period;
-    else
+    } else {
       return 0;  // We are out of buffer, so abort!
+    }
+    DPRINT("DEBUG: Bank = ");
+    DPRINTLN(bank * kRawTick);
 
     // Shift the data along and add our new bit.
+    DPRINT("DEBUG: Adding bit: ");
+    DPRINTLN((currentBit ? "1" : "0"));
     data <<= 1;
     data |= currentBit;
 
@@ -1870,10 +2081,12 @@ uint16_t IRrecv::matchManchesterData(volatile const uint16_t *data_ptr,
     if (match(bank, half_period * 2, tolerance, excess)) {
       // It is, so flip the bit we need to append, and remove a half_period of
       // time from the bank.
+      DPRINTLN("DEBUG: long interval detected");
       currentBit = !currentBit;
       bank -= raw_half_period;
     } else if (match(bank, half_period, tolerance, excess)) {
       // It is a short interval, so eat up all the time and move on.
+      DPRINTLN("DEBUG: short interval detected");
       bank = 0;
     } else if (nr_half_periods == expected_half_periods - 1 &&
                matchAtLeast(bank, half_period, tolerance, excess)) {

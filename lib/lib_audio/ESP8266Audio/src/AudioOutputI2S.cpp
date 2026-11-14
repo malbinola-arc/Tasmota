@@ -19,19 +19,18 @@
 */
 
 #include <Arduino.h>
+#if ESP_IDF_VERSION_MAJOR < 5   // TODO Arduino 3.0 Port I2S
 #ifdef ESP32
   #include "driver/i2s.h"
-#elif defined(ARDUINO_ARCH_RP2040) || defined(ESP8266)
-  #ifdef ARDUINO_ESP8266_MAJOR    //this define was added in ESP8266 Arduino Core version v3.0.1
-    #include "core_esp8266_i2s.h" //for Arduino core >= 3.0.1
-  #else
-    #include "i2s.h"              //for Arduino core <= 3.0.0
-  #endif
+#elif defined(ARDUINO_ARCH_RP2040) || ARDUINO_ESP8266_MAJOR >= 3
+  #include <I2S.h>
+#elif ARDUINO_ESP8266_MAJOR < 3
+  #include <i2s.h>
 #endif
 #include "AudioOutputI2S.h"
 
 #if defined(ESP32) || defined(ESP8266)
-AudioOutputI2S::AudioOutputI2S(int port, int output_mode, int dma_buf_count, int use_apll)
+AudioOutputI2S::AudioOutputI2S(int port, int output_mode, int dma_buf_count, int use_apll, uint8_t mult, uint32_t freq)
 {
   this->portNo = port;
   this->i2sOn = false;
@@ -44,12 +43,15 @@ AudioOutputI2S::AudioOutputI2S(int port, int output_mode, int dma_buf_count, int
 
   //set defaults
   mono = false;
+  lsb_justified = false;
   bps = 16;
   channels = 2;
   hertz = 44100;
   bclkPin = 26;
   wclkPin = 25;
   doutPin = 22;
+  mcmult = mult;
+  mclk_freq = freq;
   SetGain(1.0);
 }
 
@@ -60,10 +62,13 @@ bool AudioOutputI2S::SetPinout()
       return false; // Not allowed
 
     i2s_pin_config_t pins = {
+        .mck_io_num = mclkPin,
         .bck_io_num = bclkPin,
         .ws_io_num = wclkPin,
         .data_out_num = doutPin,
-        .data_in_num = I2S_PIN_NO_CHANGE};
+        .data_in_num = dinPin
+      };
+        //.data_in_num = I2S_PIN_NO_CHANGE};
     i2s_set_pin((i2s_port_t)portNo, &pins);
     return true;
   #else
@@ -74,11 +79,14 @@ bool AudioOutputI2S::SetPinout()
   #endif
 }
 
-bool AudioOutputI2S::SetPinout(int bclk, int wclk, int dout)
+bool AudioOutputI2S::SetPinout(int bclk, int wclk, int dout, int mclk, int din)
 {
   bclkPin = bclk;
   wclkPin = wclk;
   doutPin = dout;
+  mclkPin = mclk;
+  dinPin = din;
+
   if (i2sOn)
     return SetPinout();
 
@@ -150,6 +158,12 @@ bool AudioOutputI2S::SetOutputModeMono(bool mono)
   return true;
 }
 
+bool AudioOutputI2S::SetLsbJustified(bool lsbJustified)
+{
+  this->lsb_justified = lsbJustified;
+  return true;
+}
+
 bool AudioOutputI2S::begin(bool txDAC)
 {
   #ifdef ESP32
@@ -170,17 +184,49 @@ bool AudioOutputI2S::begin(bool txDAC)
       i2s_mode_t mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
       if (output_mode == INTERNAL_DAC)
       {
+#if CONFIG_IDF_TARGET_ESP32
         mode = (i2s_mode_t)(mode | I2S_MODE_DAC_BUILT_IN);
+#else
+        return false;
+#endif
       }
       else if (output_mode == INTERNAL_PDM)
       {
+#if CONFIG_IDF_TARGET_ESP32
         mode = (i2s_mode_t)(mode | I2S_MODE_PDM);
+#else
+        return false;
+#endif
       }
 
-      i2s_comm_format_t comm_fmt = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB);
+      i2s_comm_format_t comm_fmt;
       if (output_mode == INTERNAL_DAC)
       {
-        comm_fmt = (i2s_comm_format_t)I2S_COMM_FORMAT_I2S_MSB;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 2, 0)
+        comm_fmt = (i2s_comm_format_t) I2S_COMM_FORMAT_STAND_MSB;
+#else
+        comm_fmt = (i2s_comm_format_t) I2S_COMM_FORMAT_I2S_MSB;
+#endif
+      }
+      else if (lsb_justified)
+      {
+        comm_fmt = (i2s_comm_format_t) (I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_LSB);
+      }
+      else
+      {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 2, 0)
+        comm_fmt = (i2s_comm_format_t) (I2S_COMM_FORMAT_STAND_I2S);
+#else
+        comm_fmt = (i2s_comm_format_t) (I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB);
+#endif
+      }
+
+      if (mclkPin != I2S_PIN_NO_CHANGE) {
+        use_apll = false;
+      }
+
+      if (dinPin != I2S_PIN_NO_CHANGE) {
+        mode = (i2s_mode_t) (I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX);
       }
 
       i2s_config_t i2s_config_dac = {
@@ -191,8 +237,15 @@ bool AudioOutputI2S::begin(bool txDAC)
           .communication_format = comm_fmt,
           .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, // lowest interrupt priority
           .dma_buf_count = dma_buf_count,
-          .dma_buf_len = 64,
-          .use_apll = use_apll // Use audio PLL
+          .dma_buf_len = 128,
+          .use_apll = use_apll, // Use audio PLL
+          .tx_desc_auto_clear     = true,
+#ifdef ESP32
+          .fixed_mclk             = (int)mclk_freq,
+          //.mclk_multiple          = I2S_MCLK_MULTIPLE_DEFAULT,
+          .mclk_multiple          = (i2s_mclk_multiple_t)mcmult,
+#endif
+          .bits_per_chan          = I2S_BITS_PER_CHAN_16BIT
       };
       audioLogger->printf("+%d %p\n", portNo, &i2s_config_dac);
       if (i2s_driver_install((i2s_port_t)portNo, &i2s_config_dac, 0, NULL) != ESP_OK)
@@ -201,8 +254,12 @@ bool AudioOutputI2S::begin(bool txDAC)
       }
       if (output_mode == INTERNAL_DAC || output_mode == INTERNAL_PDM)
       {
+#if CONFIG_IDF_TARGET_ESP32
         i2s_set_pin((i2s_port_t)portNo, NULL);
         i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
+#else
+        return false;
+#endif
       }
       else
       {
@@ -273,11 +330,12 @@ bool AudioOutputI2S::ConsumeSample(int16_t sample[2])
     {
       s32 = ((Amplify(ms[RIGHTCHANNEL])) << 16) | (Amplify(ms[LEFTCHANNEL]) & 0xffff);
     }
-// Deprecated. Use i2s_write
+//"i2s_write_bytes" has been removed in the ESP32 Arduino 2.0.0,  use "i2s_write" instead.
 //    return i2s_write_bytes((i2s_port_t)portNo, (const char *)&s32, sizeof(uint32_t), 0);
-    size_t bytes_written;
-    i2s_write((i2s_port_t)portNo, (const char*)&s32, sizeof(uint32_t), &bytes_written, 0);
-    return bytes_written;
+
+    size_t i2s_bytes_written;
+    i2s_write((i2s_port_t)portNo, (const char*)&s32, sizeof(uint32_t), &i2s_bytes_written, 0);
+    return i2s_bytes_written;
   #elif defined(ESP8266)
     uint32_t s32 = ((Amplify(ms[RIGHTCHANNEL])) << 16) | (Amplify(ms[LEFTCHANNEL]) & 0xffff);
     return i2s_write_sample_nb(s32); // If we can't store it, return false.  OTW true
@@ -290,7 +348,7 @@ void AudioOutputI2S::flush()
 {
   #ifdef ESP32
     // makes sure that all stored DMA samples are consumed / played
-    int buffersize = 64 * this->dma_buf_count;
+    int buffersize = 128 * this->dma_buf_count;
     int16_t samples[2] = {0x0, 0x0};
     for (int i = 0; i < buffersize; i++)
     {
@@ -317,3 +375,4 @@ bool AudioOutputI2S::stop()
   i2sOn = false;
   return true;
 }
+#endif  // TODO Arduino 3.0 Port I2S

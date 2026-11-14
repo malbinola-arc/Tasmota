@@ -42,6 +42,16 @@
 
 */
 
+// ESP32 as of 3.x has a compiler bug in this section, with the G++ generated assembly
+// being illegal.  There's nothing wrong with the code here, it just looks like an
+// Xtensa backend issue.  Until that's fixed, no MIDI for you!
+///home/earle/Arduino/libraries/ESP8266Audio/src/libtinysoundfont/tsf.h: In function 'void tsf_channel_midi_control(tsf*, int, int, int)':
+// /home/earle/Arduino/libraries/ESP8266Audio/src/libtinysoundfont/tsf.h:2101:1: error: insn does not satisfy its constraints:
+//  2101 | }
+//       | ^
+
+#if !defined(ESP32)
+
 #ifndef TSF_INCLUDE_TSF_INL
 #define TSF_INCLUDE_TSF_INL
 
@@ -104,7 +114,7 @@ TSFDEF tsf* tsf_load(struct tsf_stream* stream);
 // Free the memory related to this tsf instance
 TSFDEF void tsf_close(tsf* f);
 
-// Stop all playing notes immediatly and reset all channel parameters
+// Stop all playing notes immediately and reset all channel parameters
 TSFDEF void tsf_reset(tsf* f);
 
 // Returns the preset index from a bank and preset number, or -1 if it does not exist in the loaded SoundFont
@@ -202,7 +212,7 @@ TSFDEF void tsf_channel_set_tuning(tsf* f, int channel, float tuning);
 TSFDEF void tsf_channel_note_on(tsf* f, int channel, int key, float vel);
 TSFDEF void tsf_channel_note_off(tsf* f, int channel, int key);
 TSFDEF void tsf_channel_note_off_all(tsf* f, int channel); //end with sustain and release
-TSFDEF void tsf_channel_sounds_off_all(tsf* f, int channel); //end immediatly
+TSFDEF void tsf_channel_sounds_off_all(tsf* f, int channel); //end immediately
 
 // Apply a MIDI control change to the channel (not all controllers are supported!)
 TSFDEF void tsf_channel_midi_control(tsf* f, int channel, int controller, int control_value);
@@ -2149,3 +2159,5 @@ TSFDEF float tsf_channel_get_tuning(tsf* f, int channel)
 #endif
 
 #endif //TSF_IMPLEMENTATION
+
+#endif // ! ESP32

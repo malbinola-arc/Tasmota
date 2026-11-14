@@ -95,7 +95,11 @@ void ESPKNXIP::__start()
 #endif
     server->begin();
   }
+#ifdef ESP8266
   udp.beginMulticast(WiFi.localIP(),  MULTICAST_IP, MULTICAST_PORT);
+#else
+  udp.beginMulticast(MULTICAST_IP, MULTICAST_PORT);
+#endif
 }
 
 void ESPKNXIP::save_to_eeprom()
@@ -553,6 +557,12 @@ void ESPKNXIP::__loop_knx()
 #endif
 
   DEBUG_PRINTLN(F(""));
+
+#ifdef ESP8266
+  while (udp.available()) { udp.read(); }  // ESP8266 does endPacket() on flush() which in turn does send() which is NOT what we want
+#else
+  udp.flush();
+#endif
 
   knx_ip_pkt_t *knx_pkt = (knx_ip_pkt_t *)buf;
 

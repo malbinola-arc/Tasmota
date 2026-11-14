@@ -14,6 +14,19 @@
 #include <cmath>
 #endif
 #include "IRtimer.h"
+#if defined(ESP32) && !defined(UNIT_TEST)
+// On ESP32 the carrier is made in software (see mark()). Run that loop from
+// IRAM, switch the pin by register and wait with the ROM delay, so the carrier
+// no longer depends on flash cache timing and on where the code lands in flash.
+// Measured on an ESP32-D0WD-V3 @ 160 MHz with digitalWrite(), delayMicroseconds()
+// and the code in flash: 35 kHz instead of 38 kHz, 28.7 kHz in a larger build.
+#include "esp_attr.h"
+#include "esp_rom_sys.h"
+#include "hal/gpio_ll.h"
+#define IRSEND_IRAM IRAM_ATTR
+#else
+#define IRSEND_IRAM
+#endif
 
 /// Constructor for an IRsend object.
 /// @param[in] IRsendPin Which GPIO pin to use when sending an IR command.
@@ -50,15 +63,19 @@ void IRsend::begin() {
 }
 
 /// Turn off the IR LED.
-void IRsend::ledOff() {
-#ifndef UNIT_TEST
+void IRSEND_IRAM IRsend::ledOff() {
+#if defined(ESP32) && !defined(UNIT_TEST)
+  gpio_ll_set_level(&GPIO, IRpin, outputOff);
+#elif !defined(UNIT_TEST)
   digitalWrite(IRpin, outputOff);
 #endif
 }
 
 /// Turn on the IR LED.
-void IRsend::ledOn() {
-#ifndef UNIT_TEST
+void IRSEND_IRAM IRsend::ledOn() {
+#if defined(ESP32) && !defined(UNIT_TEST)
+  gpio_ll_set_level(&GPIO, IRpin, outputOn);
+#elif !defined(UNIT_TEST)
   digitalWrite(IRpin, outputOn);
 #endif
 }
@@ -74,9 +91,9 @@ uint32_t IRsend::calcUSecPeriod(uint32_t hz, bool use_offset) {
       (1000000UL + hz / 2) / hz;  // The equiv of round(1000000/hz).
   // Apply the offset and ensure we don't result in a <= 0 value.
   if (use_offset)
-    return std::max((uint32_t)1, period + periodOffset);
+    return std::max(static_cast<uint32_t>(1), period + periodOffset);
   else
-    return std::max((uint32_t)1, period);
+    return std::max(static_cast<uint32_t>(1), period);
 }
 
 /// Set the output frequency modulation and duty cycle.
@@ -111,11 +128,13 @@ void IRsend::enableIROut(uint32_t freq, uint8_t duty) {
 #if ALLOW_DELAY_CALLS
 /// An ESP8266 RTOS watch-dog timer friendly version of delayMicroseconds().
 /// @param[in] usec Nr. of uSeconds to delay for.
-void IRsend::_delayMicroseconds(uint32_t usec) {
+void IRSEND_IRAM IRsend::_delayMicroseconds(uint32_t usec) {
   // delayMicroseconds() is only accurate to 16383us.
   // Ref: https://www.arduino.cc/en/Reference/delayMicroseconds
   if (usec <= kMaxAccurateUsecDelay) {
-#ifndef UNIT_TEST
+#if defined(ESP32) && !defined(UNIT_TEST)
+    esp_rom_delay_us(usec);
+#elif !defined(UNIT_TEST)
     delayMicroseconds(usec);
 #endif
   } else {
@@ -154,7 +173,7 @@ void IRsend::_delayMicroseconds(uint32_t usec) {
 ///   Hence, for greater compatibility & choice, we don't use that method.
 /// Ref:
 ///   https://www.analysir.com/blog/2017/01/29/updated-esp8266-nodemcu-backdoor-upwm-hack-for-ir-signals/
-uint16_t IRsend::mark(uint16_t usec) {
+uint16_t IRSEND_IRAM IRsend::mark(uint16_t usec) {
   // Handle the simple case of no required frequency modulation.
   if (!modulation || _dutycycle >= 100) {
     ledOn();
@@ -174,14 +193,16 @@ uint16_t IRsend::mark(uint16_t usec) {
     ledOn();
     // Calculate how long we should pulse on for.
     // e.g. Are we to close to the end of our requested mark time (usec)?
-    _delayMicroseconds(std::min((uint32_t)onTimePeriod, usec - elapsed));
+    _delayMicroseconds(std::min(static_cast<uint32_t>(onTimePeriod),
+                                usec - elapsed));
     ledOff();
     counter++;
     if (elapsed + onTimePeriod >= usec)
       return counter;  // LED is now off & we've passed our allotted time.
     // Wait for the lesser of the rest of the duty cycle, or the time remaining.
     _delayMicroseconds(
-        std::min(usec - elapsed - onTimePeriod, (uint32_t)offTimePeriod));
+        std::min(usec - elapsed - onTimePeriod,
+                 static_cast<uint32_t>(offTimePeriod)));
     elapsed = usecTimer.elapsed();  // Update & recache the actual elapsed time.
   }
   return counter;
@@ -191,7 +212,7 @@ uint16_t IRsend::mark(uint16_t usec) {
 /// Sends an IR space for the specified number of microseconds.
 /// A space is no output, so the PWM output is disabled.
 /// @param[in] time Time in microseconds (us).
-void IRsend::space(uint32_t time) {
+void IRSEND_IRAM IRsend::space(uint32_t time) {
   ledOff();
   if (time == 0) return;
   _delayMicroseconds(time);
@@ -214,7 +235,7 @@ int8_t IRsend::calibrate(uint16_t hz) {
   uint32_t timeTaken = usecTimer.elapsed();  // Record the time it took.
   // While it shouldn't be necessary, assume at least 1 pulse, to avoid a
   // divide by 0 situation.
-  pulses = std::max(pulses, (uint16_t)1U);
+  pulses = std::max(pulses, static_cast<uint16_t>(1U));
   uint32_t calcPeriod = calcUSecPeriod(hz);  // e.g. @38kHz it should be 26us.
   // Assuming 38kHz for the example calculations:
   // In a 65535us pulse, we should have 2520.5769 pulses @ 26us periods.
@@ -227,10 +248,19 @@ int8_t IRsend::calibrate(uint16_t hz) {
   // Calculate the actual period from the actual time & the actual pulses
   // generated.
   double_t actualPeriod = (double_t)timeTaken / (double_t)pulses;
-  // Store the difference between the actual time per period vs. calculated.
-  periodOffset = (int8_t)((double_t)calcPeriod - actualPeriod);
+  // Store the difference between the actual time per period vs. calculated,
+  // rounded to the nearest microsecond. Truncating towards zero left the
+  // carrier at 37 kHz on an ESP32 where the best offset is about -1.7 us.
+  double_t diff = (double_t)calcPeriod - actualPeriod;
+  periodOffset = (int8_t)(diff < 0 ? diff - 0.5 : diff + 0.5);
   return periodOffset;
 }
+
+/// Set the period offset (in uSeconds) used for the software carrier.
+/// @param[in] offset The offset, e.g. the result of an earlier calibrate().
+/// @note Lets several IRsend objects share one calibration. It takes effect
+///  with the next enableIROut(), which every send method calls.
+void IRsend::setPeriodOffset(int8_t offset) { periodOffset = offset; }
 
 /// Generic method for sending data that is common to most protocols.
 /// Will send leading or trailing 0's if the nbits is larger than the number
@@ -560,6 +590,7 @@ uint16_t IRsend::minRepeats(const decode_type_t protocol) {
     case AIWA_RC_T501:
     case AMCOR:
     case COOLIX:
+    case COOLIX48:
     case ELITESCREENS:
     case GICABLE:
     case INAX:
@@ -570,6 +601,7 @@ uint16_t IRsend::minRepeats(const decode_type_t protocol) {
     case MULTIBRACKETS:
     case SHERWOOD:
     case TOSHIBA_AC:
+    case TOTO:
       return kSingleRepeat;
     // Special
     case AIRWELL:
@@ -601,7 +633,10 @@ uint16_t IRsend::minRepeats(const decode_type_t protocol) {
 uint16_t IRsend::defaultBits(const decode_type_t protocol) {
   switch (protocol) {
     case MULTIBRACKETS:
+    case GORENJE:
       return 8;
+    case WOWWEE:
+      return 11;
     case RC5:
     case SYMPHONY:
       return 12;
@@ -632,11 +667,13 @@ uint16_t IRsend::defaultBits(const decode_type_t protocol) {
     case MIDEA24:
     case NIKAI:
     case RCMM:
+    case TOTO:
     case TRANSCOLD:
       return 24;
     case LG:
     case LG2:
       return 28;
+    case ARRIS:
     case CARRIER_AC:
     case ELITESCREENS:
     case EPSON:
@@ -660,11 +697,15 @@ uint16_t IRsend::defaultBits(const decode_type_t protocol) {
       return kDoshishaBits;  // 40
     case SANYO_LC7461:
       return kSanyoLC7461Bits;  // 42
+    case COOLIX48:
     case GOODWEATHER:
     case KELON:
     case MIDEA:
     case PANASONIC:
       return 48;
+    case CLIMABUTLER:
+      return kClimaButlerBits;  // 52
+    case AIRTON:
     case ECOCLIM:
     case MAGIQUEST:
     case VESTEL_AC:
@@ -678,8 +719,14 @@ uint16_t IRsend::defaultBits(const decode_type_t protocol) {
       return 64;
     case ARGO:
       return kArgoBits;
+    case BOSCH144:
+      return kBosch144Bits;
     case CORONA_AC:
       return kCoronaAcBits;
+    case CARRIER_AC84:
+      return kCarrierAc84Bits;
+    case CARRIER_AC128:
+      return kCarrierAc128Bits;
     case DAIKIN:
       return kDaikinBits;
     case DAIKIN128:
@@ -692,18 +739,26 @@ uint16_t IRsend::defaultBits(const decode_type_t protocol) {
       return kDaikin176Bits;
     case DAIKIN2:
       return kDaikin2Bits;
+    case DAIKIN200:
+      return kDaikin200Bits;
     case DAIKIN216:
       return kDaikin216Bits;
+    case DAIKIN312:
+      return kDaikin312Bits;
     case DAIKIN64:
       return kDaikin64Bits;
     case ELECTRA_AC:
       return kElectraAcBits;
+    case EUROM:
+      return kEuromBits;
     case GREE:
       return kGreeBits;
     case HAIER_AC:
       return kHaierACBits;
     case HAIER_AC_YRW02:
       return kHaierACYRW02Bits;
+    case HAIER_AC160:
+      return kHaierAC160Bits;
     case HAIER_AC176:
       return kHaierAC176Bits;
     case HITACHI_AC:
@@ -714,10 +769,16 @@ uint16_t IRsend::defaultBits(const decode_type_t protocol) {
       return kHitachiAc2Bits;
     case HITACHI_AC3:
       return kHitachiAc3Bits;
+    case HITACHI_AC264:
+      return kHitachiAc264Bits;
+    case HITACHI_AC296:
+      return kHitachiAc296Bits;
     case HITACHI_AC344:
       return kHitachiAc344Bits;
     case HITACHI_AC424:
       return kHitachiAc424Bits;
+    case KELON168:
+      return kKelon168Bits;
     case KELVINATOR:
       return kKelvinatorBits;
     case MILESTAG2:
@@ -738,14 +799,20 @@ uint16_t IRsend::defaultBits(const decode_type_t protocol) {
       return kNeoclimaBits;
     case PANASONIC_AC:
       return kPanasonicAcBits;
+    case RHOSS:
+      return kRhossBits;
     case SAMSUNG_AC:
       return kSamsungAcBits;
     case SANYO_AC:
       return kSanyoAcBits;
     case SANYO_AC88:
       return kSanyoAc88Bits;
+    case SANYO_AC152:
+      return kSanyoAc152Bits;
     case SHARP_AC:
       return kSharpAcBits;
+    case TCL96AC:
+      return kTcl96AcBits;
     case TCL112AC:
       return kTcl112AcBits;
     case TEKNOPOINT:
@@ -761,6 +828,10 @@ uint16_t IRsend::defaultBits(const decode_type_t protocol) {
       return kWhirlpoolAcBits;
     case XMP:
       return kXmpBits;
+    case YORK:
+      return kYorkBits;
+    case BLUESTARHEAVY:
+      return kBluestarHeavyBits;
     // No default amount of bits.
     case FUJITSU_AC:
     case MWM:
@@ -781,6 +852,11 @@ bool IRsend::send(const decode_type_t type, const uint64_t data,
   uint16_t min_repeat __attribute__((unused)) =
       std::max(IRsend::minRepeats(type), repeat);
   switch (type) {
+#if SEND_AIRTON
+    case AIRTON:
+      sendAirton(data, nbits, min_repeat);
+      break;
+#endif  // SEND_AIRTON
 #if SEND_AIRWELL
     case AIRWELL:
       sendAirwell(data, nbits, min_repeat);
@@ -790,7 +866,12 @@ bool IRsend::send(const decode_type_t type, const uint64_t data,
     case AIWA_RC_T501:
       sendAiwaRCT501(data, nbits, min_repeat);
       break;
-#endif
+#endif  // SEND_AIWA_RC_T501
+#if SEND_ARRIS
+    case ARRIS:
+      sendArris(data, nbits, min_repeat);
+      break;
+#endif  // SEND_ARRIS
 #if SEND_BOSE
     case BOSE:
       sendBose(data, nbits, min_repeat);
@@ -811,11 +892,21 @@ bool IRsend::send(const decode_type_t type, const uint64_t data,
       sendCarrierAC64(data, nbits, min_repeat);
       break;
 #endif  // SEND_CARRIER_AC64
+#if SEND_CLIMABUTLER
+    case CLIMABUTLER:
+      sendClimaButler(data, nbits, min_repeat);
+      break;
+#endif  // SEND_CLIMABUTLER
 #if SEND_COOLIX
     case COOLIX:
       sendCOOLIX(data, nbits, min_repeat);
       break;
-#endif
+#endif  // SEND_COOLIX
+#if SEND_COOLIX48
+    case COOLIX48:
+      sendCoolix48(data, nbits, min_repeat);
+      break;
+#endif  // SEND_COOLIX48
 #if SEND_DAIKIN64
     case DAIKIN64:
       sendDaikin64(data, nbits, min_repeat);
@@ -864,6 +955,11 @@ bool IRsend::send(const decode_type_t type, const uint64_t data,
 #if SEND_GOODWEATHER
     case GOODWEATHER:
       sendGoodweather(data, nbits, min_repeat);
+      break;
+#endif
+#if SEND_GORENJE
+    case GORENJE:
+      sendGorenje(data, nbits, min_repeat);
       break;
 #endif
 #if SEND_GREE
@@ -1039,6 +1135,11 @@ bool IRsend::send(const decode_type_t type, const uint64_t data,
       sendTeco(data, nbits, min_repeat);
       break;
 #endif  // SEND_TECO
+#if SEND_TOTO
+    case TOTO:
+      sendToto(data, nbits, min_repeat);
+      break;
+#endif  // SEND_TOTO
 #if SEND_TRANSCOLD
     case TRANSCOLD:
       sendTranscold(data, nbits, min_repeat);
@@ -1059,6 +1160,11 @@ bool IRsend::send(const decode_type_t type, const uint64_t data,
       sendWhynter(data, nbits, min_repeat);
       break;
 #endif
+#if SEND_WOWWEE
+    case WOWWEE:
+      sendWowwee(data, nbits, min_repeat);
+      break;
+#endif  // SEND_WOWWEE
 #if SEND_XMP
     case XMP:
       sendXmp(data, nbits, min_repeat);
@@ -1099,6 +1205,21 @@ bool IRsend::send(const decode_type_t type, const uint8_t *state,
       sendArgo(state, nbytes);
       break;
 #endif  // SEND_ARGO
+#if SEND_BOSCH144
+    case BOSCH144:
+      sendBosch144(state, nbytes);
+      break;
+#endif  // SEND_BOSCH144
+#if SEND_CARRIER_AC84
+    case CARRIER_AC84:
+      sendCarrierAC84(state, nbytes);
+      break;
+#endif  // SEND_CARRIER_AC84
+#if SEND_CARRIER_AC128
+    case CARRIER_AC128:
+      sendCarrierAC128(state, nbytes);
+      break;
+#endif  // SEND_CARRIER_AC128
 #if SEND_CORONA_AC
     case CORONA_AC:
       sendCoronaAc(state, nbytes);
@@ -1134,16 +1255,31 @@ bool IRsend::send(const decode_type_t type, const uint8_t *state,
       sendDaikin2(state, nbytes);
       break;
 #endif  // SEND_DAIKIN2
+#if SEND_DAIKIN200
+    case DAIKIN200:
+      sendDaikin200(state, nbytes);
+      break;
+#endif  // SEND_DAIKIN200
 #if SEND_DAIKIN216
     case DAIKIN216:
       sendDaikin216(state, nbytes);
       break;
 #endif  // SEND_DAIKIN216
+#if SEND_DAIKIN312
+    case DAIKIN312:
+      sendDaikin312(state, nbytes);
+      break;
+#endif  // SEND_DAIKIN312
 #if SEND_ELECTRA_AC
     case ELECTRA_AC:
       sendElectraAC(state, nbytes);
       break;
 #endif  // SEND_ELECTRA_AC
+#if SEND_EUROM
+    case EUROM:
+      sendEurom(state, nbytes);
+      break;
+#endif  // SEND_EUROM
 #if SEND_FUJITSU_AC
     case FUJITSU_AC:
       sendFujitsuAC(state, nbytes);
@@ -1164,6 +1300,11 @@ bool IRsend::send(const decode_type_t type, const uint8_t *state,
       sendHaierACYRW02(state, nbytes);
       break;
 #endif  // SEND_HAIER_AC_YRW02
+#if SEND_HAIER_AC160
+    case HAIER_AC160:
+      sendHaierAC160(state, nbytes);
+      break;
+#endif  // SEND_HAIER_AC160
 #if SEND_HAIER_AC176
     case HAIER_AC176:
       sendHaierAC176(state, nbytes);
@@ -1189,6 +1330,16 @@ bool IRsend::send(const decode_type_t type, const uint8_t *state,
       sendHitachiAc3(state, nbytes);
       break;
 #endif  // SEND_HITACHI_AC3
+#if SEND_HITACHI_AC264
+    case HITACHI_AC264:
+      sendHitachiAc264(state, nbytes);
+      break;
+#endif  // SEND_HITACHI_AC264
+#if SEND_HITACHI_AC296
+    case HITACHI_AC296:
+      sendHitachiAc296(state, nbytes);
+      break;
+#endif  // SEND_HITACHI_AC296
 #if SEND_HITACHI_AC344
     case HITACHI_AC344:
       sendHitachiAc344(state, nbytes);
@@ -1199,6 +1350,11 @@ bool IRsend::send(const decode_type_t type, const uint8_t *state,
       sendHitachiAc424(state, nbytes);
       break;
 #endif  // SEND_HITACHI_AC424
+#if SEND_KELON168
+    case KELON168:
+      sendKelon168(state, nbytes);
+      break;
+#endif  // SEND_KELON168
 #if SEND_KELVINATOR
     case KELVINATOR:
       sendKelvinator(state, nbytes);
@@ -1247,6 +1403,11 @@ bool IRsend::send(const decode_type_t type, const uint8_t *state,
       sendPanasonicAC(state, nbytes);
       break;
 #endif  // SEND_PANASONIC_AC
+#if SEND_RHOSS
+    case RHOSS:
+      sendRhoss(state, nbytes);
+      break;
+#endif  // SEND_RHOSS
 #if SEND_SAMSUNG_AC
     case SAMSUNG_AC:
       sendSamsungAC(state, nbytes);
@@ -1262,11 +1423,21 @@ bool IRsend::send(const decode_type_t type, const uint8_t *state,
       sendSanyoAc88(state, nbytes);
       break;
 #endif  // SEND_SANYO_AC88
+#if SEND_SANYO_AC152
+    case SANYO_AC152:
+      sendSanyoAc152(state, nbytes);
+      break;
+#endif  // SEND_SANYO_AC152
 #if SEND_SHARP_AC
     case SHARP_AC:
       sendSharpAc(state, nbytes);
       break;
 #endif  // SEND_SHARP_AC
+#if SEND_TCL96AC
+    case TCL96AC:
+      sendTcl96Ac(state, nbytes);
+      break;
+#endif  // SEND_TCL96AC
 #if SEND_TCL112AC
     case TCL112AC:
       sendTcl112Ac(state, nbytes);
@@ -1297,6 +1468,16 @@ bool IRsend::send(const decode_type_t type, const uint8_t *state,
       sendWhirlpoolAC(state, nbytes);
       break;
 #endif  // SEND_WHIRLPOOL_AC
+#if SEND_YORK
+    case YORK:
+      sendYork(state, nbytes);
+      break;
+#endif  // SEND_YORK
+#if SEND_BLUESTARHEAVY
+    case BLUESTARHEAVY:
+      sendBluestarHeavy(state, nbytes);
+      break;
+#endif  // SEND_BLUESTARHEAVY
     default:
       return false;
   }

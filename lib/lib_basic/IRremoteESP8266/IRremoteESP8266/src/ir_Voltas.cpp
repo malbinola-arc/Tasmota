@@ -422,7 +422,7 @@ uint16_t IRVoltas::getOnTime(void) const {
 /// 0 disables the timer. Max is 23 hrs & 59 mins (1439 mins)
 void IRVoltas::setOnTime(const uint16_t nr_of_mins) {
   // Cap the total number of mins.
-  uint16_t mins = std::min(nr_of_mins, (uint16_t)(23 * 60 + 59));
+  uint16_t mins = std::min(nr_of_mins, static_cast<uint16_t>(23 * 60 + 59));
   uint16_t hrs = (mins / 60) + 1;
   _.OnTimerMins = mins % 60;
   _.OnTimer12Hr = hrs / 12;
@@ -442,7 +442,7 @@ uint16_t IRVoltas::getOffTime(void) const {
 /// 0 disables the timer. Max is 23 hrs & 59 mins (1439 mins)
 void IRVoltas::setOffTime(const uint16_t nr_of_mins) {
   // Cap the total number of mins.
-  uint16_t mins = std::min(nr_of_mins, (uint16_t)(23 * 60 + 59));
+  uint16_t mins = std::min(nr_of_mins, static_cast<uint16_t>(23 * 60 + 59));
   uint16_t hrs = (mins / 60) + 1;
   _.OffTimerMins = mins % 60;
   _.OffTimer12Hr = hrs / 12;
@@ -454,7 +454,7 @@ void IRVoltas::setOffTime(const uint16_t nr_of_mins) {
 /// @param[in] prev Ptr to the previous state if available.
 /// @return The stdAc equivalent of the native settings.
 stdAc::state_t IRVoltas::toCommon(const stdAc::state_t *prev) {
-  stdAc::state_t result;
+  stdAc::state_t result{};
   // Start with the previous state if given it.
   if (prev != NULL) {
     result = *prev;
